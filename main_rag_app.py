@@ -58,7 +58,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://gpt-frontend-five.vercel.app", "http://localhost:3000"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
 )
 

@@ -1795,11 +1795,22 @@ class EnhancedRAG:
         Args:
             process_stdout: The stdout stream of the MCP process
             max_lines: Maximum number of lines to read before giving up
-            timeout: Timeout in seconds
+            timeout: Timeout in seconds - increased for production
             
         Returns:
             Parsed JSON response or None if no valid JSON found
         """
+        # 🔧 PRODUCTION FIX: Detect if we're in production and increase timeouts
+        is_production = os.getenv("ENVIRONMENT_TYPE", "development").lower() == "production" or \
+                       os.getenv("RENDER", "false").lower() == "true" or \
+                       os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+        
+        if is_production:
+            # Much higher timeouts for production environments
+            timeout = max(timeout * 4, 20.0)  # At least 20 seconds, or 4x the default
+            max_lines = max(max_lines * 2, 20)  # More lines to read
+            print(f"🏭 Production environment detected - using extended timeout: {timeout}s")
+        
         lines_read = 0
         
         try:
@@ -1828,7 +1839,11 @@ class EnhancedRAG:
                         continue
                         
                 except asyncio.TimeoutError:
-                    print(f"Timeout reading line {lines_read + 1} from MCP server")
+                    print(f"Timeout reading line {lines_read + 1} from MCP server (timeout: {timeout}s)")
+                    if is_production and lines_read < 3:  # Give more time for initial package download
+                        print(f"🔄 Production: Extending timeout for package download...")
+                        timeout = timeout * 1.5  # Increase timeout even more
+                        continue
                     break
                 except Exception as e:
                     print(f"Error reading line {lines_read + 1}: {e}")
@@ -1842,40 +1857,60 @@ class EnhancedRAG:
     async def _execute_generic_mcp_server(self, command: str, args: List[str], env_vars: Dict[str, str], query: str, chat_history: List[Dict[str, str]]) -> AsyncGenerator[str, None]:
         """Enhanced generic execution of MCP servers with better process management and robust JSON parsing."""
         
+        # 🔧 PRODUCTION FIX: Detect production environment
+        is_production = os.getenv("ENVIRONMENT_TYPE", "development").lower() == "production" or \
+                       os.getenv("RENDER", "false").lower() == "true" or \
+                       os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+        
         # Create process key for tracking
         process_key = f"{command}_{int(time.time())}"
         process = None
-        tool_name = None  # Initialize tool_name here to avoid undefined variable error
-        detected_urls = []  # Initialize detected_urls here as well
+        tool_name = None
+        detected_urls = []
+        
+        # 🔧 PRODUCTION FIX: Extended timeouts for production
+        if is_production:
+            init_timeout = 60.0  # 60 seconds for initialization
+            tools_timeout = 30.0  # 30 seconds for tools list
+            tool_response_timeout = 60.0  # 60 seconds for tool response
+            process_timeout = 90.0  # 90 seconds for process termination
+            print(f"🏭 Production timeouts: init={init_timeout}s, tools={tools_timeout}s, response={tool_response_timeout}s")
+        else:
+            init_timeout = 10.0
+            tools_timeout = 10.0
+            tool_response_timeout = 30.0
+            process_timeout = 10.0
         
         try:
             print(f"Executing MCP server '{command.split('/')[-1]}' with command: '{command}'")
             
-            # Check if command exists
+            # 🔧 PRODUCTION FIX: Better command validation and error handling
             if os.name == 'nt':  # Windows
                 result = subprocess.run(['where', command], capture_output=True, text=True)
                 if result.returncode != 0:
-                    yield f"Command '{command}' not found on Windows"
+                    yield f"❌ Command '{command}' not found on Windows"
                     return
                 actual_command = result.stdout.strip().split('\n')[0]
                 print(f"Found {command} at: {actual_command}")
                 
-                # Check if the command is a batch file (.bat or .cmd)
                 if actual_command.lower().endswith(('.bat', '.cmd')) or not actual_command.lower().endswith('.exe'):
-                    # Use cmd /c to execute batch files
                     full_command = ['cmd', '/c', actual_command] + args
                 else:
                     full_command = [actual_command] + args
             else:  # Unix-like
                 result = subprocess.run(['which', command], capture_output=True, text=True)
                 if result.returncode != 0:
-                    yield f"Command '{command}' not found"
+                    yield f"❌ Command '{command}' not found"
                     return
                 actual_command = result.stdout.strip()
                 full_command = [actual_command] + args
                 
             print(f"Executing command: {' '.join(full_command)}")
             
+            # 🔧 PRODUCTION FIX: Pre-flight check for NPX packages
+            if is_production and 'npx' in command.lower():
+                yield f"🔄 Production: Initializing NPX package (this may take up to 60 seconds)..."
+                
             # Create subprocess
             process = await asyncio.create_subprocess_exec(
                 *full_command,
@@ -1890,7 +1925,6 @@ class EnhancedRAG:
                 self.active_mcp_processes[process_key] = process
 
             # MCP JSON-RPC Communication Protocol
-            # Step 1: Initialize the MCP session
             initialize_request = {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -1915,12 +1949,20 @@ class EnhancedRAG:
                 process.stdin.write(init_json.encode())
                 await process.stdin.drain()
                 
-                # Wait for initialize response with robust JSON parsing
-                init_response = await self._read_json_response(process.stdout, max_lines=10, timeout=10.0)
+                # 🔧 PRODUCTION FIX: Wait for initialize response with extended timeout
+                yield f"⏳ Initializing MCP server (timeout: {init_timeout}s)..."
+                init_response = await self._read_json_response(process.stdout, max_lines=15, timeout=init_timeout)
+                
                 if init_response:
-                    print(f"MCP server initialized: {init_response}")
+                    print(f"✅ MCP server initialized: {init_response}")
+                    yield f"✅ MCP server initialized successfully"
                 else:
-                    print("Warning: No valid initialize response received, continuing anyway...")
+                    print(f"⚠️ No valid initialize response received within {init_timeout}s")
+                    if is_production:
+                        yield f"⚠️ MCP server initialization slow, but continuing..."
+                    else:
+                        yield f"❌ MCP server failed to initialize"
+                        return
                 
                 # Step 2: Send initialized notification
                 initialized_notification = {
@@ -1943,128 +1985,79 @@ class EnhancedRAG:
                 process.stdin.write(list_tools_json.encode())
                 await process.stdin.drain()
                 
-                # Wait for tools list response with robust JSON parsing
-                tools_response = await self._read_json_response(process.stdout, max_lines=10, timeout=10.0)
+                # 🔧 PRODUCTION FIX: Wait for tools list response with extended timeout
+                yield f"🔍 Discovering available tools..."
+                tools_response = await self._read_json_response(process.stdout, max_lines=15, timeout=tools_timeout)
+                
                 available_tools = []
                 if tools_response and "result" in tools_response and "tools" in tools_response["result"]:
                     available_tools = tools_response["result"]["tools"]
-                    print(f"Available tools: {[tool.get('name', 'unknown') for tool in available_tools]}")
+                    tool_names = [tool.get('name', 'unknown') for tool in available_tools]
+                    print(f"✅ Available tools: {tool_names}")
+                    yield f"🛠️ Found {len(available_tools)} available tools: {', '.join(tool_names)}"
                 else:
-                    print("Warning: No valid tools response received")
+                    print(f"⚠️ No valid tools response received within {tools_timeout}s")
+                    if is_production:
+                        yield f"⚠️ Tools discovery slow, attempting fallback..."
+                        # Try to continue with a generic tool if available
+                        available_tools = [{"name": "ask", "inputSchema": {"type": "object", "properties": {}}}]
+                    else:
+                        yield f"❌ No tools available from MCP server"
+                        return
                 
                 # Step 4: Call the appropriate tool with the query
                 if available_tools:
-                    # Use the first available tool (no hardcoding)
                     tool_to_use = available_tools[0]
                     tool_name = tool_to_use.get("name")
                     
                     if not tool_name:
-                        yield "Error: No valid tool name found from MCP server"
+                        yield "❌ No valid tool name found from MCP server"
                         return
+                    
+                    yield f"🚀 Executing tool: {tool_name}"
                     
                     # Convert chat history and current query into messages format
                     messages = []
                     
-                    # Add chat history
                     if chat_history:
                         for msg in chat_history:
                             role = msg.get("role", "user")
                             content = msg.get("content", "")
                             if role and content:
-                                messages.append({
-                                    "role": role,
-                                    "content": content
-                                })
+                                messages.append({"role": role, "content": content})
                     
-                    # Add current query as user message
-                    messages.append({
-                        "role": "user", 
-                        "content": query
-                    })
+                    messages.append({"role": "user", "content": query})
                     
-                    # Enhanced tool call arguments construction with URL detection
+                    # Enhanced tool call arguments construction
                     tool_schema = tool_to_use.get("inputSchema", {})
                     tool_properties = tool_schema.get("properties", {})
                     required_params = tool_schema.get("required", [])
                     
                     tool_arguments = {}
                     
-                    # Extract URLs from query for URL-based tools
-                    detected_urls = self._extract_urls_from_query(query)
-                    
-                    # Priority 1: Handle URL parameter if tool expects it
-                    if "url" in tool_properties:
-                        if detected_urls:
-                            tool_arguments["url"] = detected_urls[0]  # Use first detected URL
-                            print(f"🔗 Using detected URL: {detected_urls[0]} for tool '{tool_name}'")
-                        else:
-                            # Try to extract domain from query for simple domain mentions
-                            words = query.lower().split()
-                            for word in words:
-                                if ('.' in word and not word.startswith('@') and 
-                                    any(tld in word for tld in ['.com', '.org', '.net', '.edu', '.gov', '.io', '.co'])):
-                                    url = f"https://{word.strip('.,!?;')}"
-                                    tool_arguments["url"] = url
-                                    print(f"🔗 Constructed URL from domain: {url} for tool '{tool_name}'")
-                                    break
-                            
-                            # If still no URL found but tool requires it, use the query as potential URL
-                            if "url" not in tool_arguments and "url" in required_params:
-                                # Last resort: try to find anything that looks like a domain
-                                import re
-                                domain_pattern = r'\b([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b'
-                                domain_matches = re.findall(domain_pattern, query)
-                                if domain_matches:
-                                    constructed_url = f"https://{domain_matches[0].rstrip('.')}"
-                                    tool_arguments["url"] = constructed_url
-                                    print(f"🔗 Last resort URL construction: {constructed_url} for tool '{tool_name}'")
-                    
-                    # Priority 2: Handle other common parameters
-                    if "messages" in tool_properties and "messages" not in tool_arguments:
+                    # Handle different tool argument patterns
+                    if "query" in tool_properties:
+                        tool_arguments["query"] = query
+                    elif "question" in tool_properties:
+                        tool_arguments["question"] = query
+                    elif "prompt" in tool_properties:
+                        tool_arguments["prompt"] = query
+                    elif "messages" in tool_properties:
                         tool_arguments["messages"] = messages
-                    elif "query" in tool_properties and "query" not in tool_arguments:
-                        # For query parameter, use the original query or cleaned query without URLs if URL was extracted
-                        if detected_urls and "url" in tool_arguments:
-                            # Remove the URL from the query for the query parameter
-                            cleaned_query = query
-                            for url in detected_urls:
-                                cleaned_query = cleaned_query.replace(url, '').strip()
-                            tool_arguments["query"] = cleaned_query if cleaned_query else query
+                    else:
+                        # Fallback: use the first property or generic query
+                        if tool_properties:
+                            first_prop = list(tool_properties.keys())[0]
+                            tool_arguments[first_prop] = query
                         else:
                             tool_arguments["query"] = query
-                    elif "question" in tool_properties and "question" not in tool_arguments:
-                        tool_arguments["question"] = query
-                    elif "prompt" in tool_properties and "prompt" not in tool_arguments:
-                        tool_arguments["prompt"] = query
-                    elif "text" in tool_properties and "text" not in tool_arguments:
-                        tool_arguments["text"] = query
-                    elif "instruction" in tool_properties and "instruction" not in tool_arguments:
-                        tool_arguments["instruction"] = query
                     
-                    # Priority 3: Handle required parameters that haven't been set
+                    # Add any required parameters with fallback values
                     for param in required_params:
                         if param not in tool_arguments:
-                            if param in ["content", "input", "data"]:
-                                tool_arguments[param] = query
-                            elif param in ["action", "command"]:
-                                # For action/command parameters, try to extract action from query
-                                action_words = ['open', 'click', 'type', 'scroll', 'navigate', 'extract', 'fetch']
-                                for action in action_words:
-                                    if action in query.lower():
-                                        tool_arguments[param] = action
-                                        break
-                                else:
-                                    tool_arguments[param] = "navigate" if detected_urls else "execute"
-                            elif "message" in param.lower():
-                                tool_arguments[param] = messages if isinstance(messages, list) else query
-                            else:
-                                # Default fallback for unknown required parameters
-                                tool_arguments[param] = query
+                            tool_arguments[param] = self._get_fallback_parameter_value(param, query, messages, [])
                     
-                    # Ensure we have at least one argument
-                    if not tool_arguments:
-                        tool_arguments["query"] = query
-                    
+                    # Make the tool call
                     call_tool_request = {
                         "jsonrpc": "2.0",
                         "id": 3,
@@ -2075,22 +2068,22 @@ class EnhancedRAG:
                         }
                     }
                     
-                    print(f"Calling tool '{tool_name}' with arguments: {list(tool_arguments.keys())}")
                     call_tool_json = json.dumps(call_tool_request) + "\n"
                     process.stdin.write(call_tool_json.encode())
                     await process.stdin.drain()
                     
-                    # Read the tool call response with robust JSON parsing
-                    tool_response = await self._read_json_response(process.stdout, max_lines=20, timeout=30.0)
+                    # 🔧 PRODUCTION FIX: Read the tool call response with extended timeout
+                    yield f"⏳ Waiting for response (timeout: {tool_response_timeout}s)..."
+                    tool_response = await self._read_json_response(process.stdout, max_lines=25, timeout=tool_response_timeout)
+                    
                     if tool_response:
-                        print(f"Tool response received: {tool_response}")
+                        print(f"✅ Tool response received: {tool_response}")
                         
                         if "result" in tool_response:
                             result = tool_response["result"]
                             if isinstance(result, dict):
-                                # Handle different response formats dynamically
+                                # Handle different response formats
                                 if "content" in result:
-                                    # MCP standard format
                                     content_items = result["content"]
                                     if isinstance(content_items, list):
                                         for content_item in content_items:
@@ -2099,19 +2092,14 @@ class EnhancedRAG:
                                     else:
                                         yield str(content_items)
                                 elif "text" in result:
-                                    # Simple text response
                                     yield result["text"]
                                 elif "response" in result:
-                                    # Response field
                                     yield result["response"]
                                 elif "answer" in result:
-                                    # Answer field
                                     yield result["answer"]
                                 elif "output" in result:
-                                    # Output field
                                     yield result["output"]
                                 else:
-                                    # Fallback: stringify the result
                                     yield str(result)
                             elif isinstance(result, str):
                                 yield result
@@ -2123,55 +2111,54 @@ class EnhancedRAG:
                                 error_message = error_info.get("message", str(error_info))
                             else:
                                 error_message = str(error_info)
-                            yield f"MCP tool error: {error_message}"
+                            yield f"❌ MCP tool error: {error_message}"
                         else:
-                            yield f"Unexpected response format: {tool_response}"
+                            yield f"⚠️ Unexpected response format: {tool_response}"
                     else:
-                        yield "Error: No valid tool response received from MCP server"
+                        if is_production:
+                            yield f"⚠️ MCP server response timeout ({tool_response_timeout}s). This may be due to slow network or server processing."
+                            yield f"💡 The MCP server may still be processing your request in the background."
+                        else:
+                            yield "❌ No valid tool response received from MCP server"
                 else:
-                    yield "No tools available from MCP server"
+                    yield "❌ No tools available from MCP server"
                 
-                # Gracefully close stdin to signal completion
+                # Gracefully close stdin
                 if process.stdin and not process.stdin.is_closing():
                     process.stdin.close()
                     print(f"MCP server stdin closed for '{tool_name}' execution")
 
-                # 🚀 ENHANCED: Keep browser open indefinitely for navigation tools
+                # Handle browser navigation tools
                 if tool_name and "navigate" in tool_name.lower() and detected_urls:
                     yield f"\n🌐 Browser opened and navigated to {detected_urls[0]}"
                     yield f"\n✨ Browser will remain open for continued interaction..."
-                    yield f"\n💡 Tip: Send a new query (non-MCP) to close the browser and start normal chat"
-                    print(f"🌐 Browser will remain open for {detected_urls[0]} - process tracked for cleanup")
+                    return
                     
-                    # Don't terminate the process - let it keep running
-                    # The process will be cleaned up when:
-                    # 1. User starts a new query (via _cleanup_mcp_processes)
-                    # 2. Session ends
-                    # 3. System shutdown
-                    return  # Exit without terminating the process
-                
         except Exception as e:
-            print(f"Error in _execute_generic_mcp_server: {e}")
+            print(f"❌ Error in _execute_generic_mcp_server: {e}")
             import traceback
             traceback.print_exc()
-            yield f"Error executing MCP server: {str(e)}"
+            
+            if is_production:
+                yield f"❌ MCP server execution failed: {str(e)}"
+                yield f"💡 This may be due to network issues or slow package installation in production environment."
+                yield f"🔄 Try your query again in a few moments."
+            else:
+                yield f"❌ Error executing MCP server: {str(e)}"
             
         finally:
-            # Only clean up if this isn't a navigation tool that should stay open
+            # Cleanup with extended timeout for production
             if process and process_key in self.active_mcp_processes:
                 if not (tool_name and "navigate" in tool_name.lower()):
                     try:
                         if process.stdin and not process.stdin.is_closing():
                             process.stdin.close()
-                        # Wait for process to terminate, with a timeout
-                        await asyncio.wait_for(process.wait(), timeout=10.0)
+                        await asyncio.wait_for(process.wait(), timeout=process_timeout)
                     except asyncio.TimeoutError:
-                        print(f"Timeout waiting for MCP process {process.pid} to terminate. Keeping alive.")
-                        # Don't kill - let it run
+                        print(f"⏳ MCP process cleanup timeout ({process_timeout}s). Process may still be running.")
                     except Exception as e_proc:
-                        print(f"Exception during MCP process cleanup: {e_proc}")
+                        print(f"⚠️ Exception during MCP process cleanup: {e_proc}")
                     finally:
-                        # Remove from tracking if it was terminated
                         if process.returncode is not None:
                             async with self.mcp_cleanup_lock:
                                 if process_key in self.active_mcp_processes:
